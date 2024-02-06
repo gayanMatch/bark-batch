@@ -6,7 +6,7 @@ from .generation import codec_decode, generate_coarse, generate_fine, generate_t
 
 
 def text_to_semantic(
-    text: str,
+    text,
     history_prompt: Optional[Union[Dict, str]] = None,
     temp: float = 0.7,
     silent: bool = False,
@@ -24,7 +24,7 @@ def text_to_semantic(
     """
     x_semantic = generate_text_semantic(
         text,
-        history_prompt=history_prompt,
+        history_prompts=history_prompt,
         temp=temp,
         silent=silent,
         use_kv_caching=True
@@ -53,14 +53,14 @@ def semantic_to_waveform(
     """
     coarse_tokens = generate_coarse(
         semantic_tokens,
-        history_prompt=history_prompt,
+        history_prompts=history_prompt,
         temp=temp,
         silent=silent,
         use_kv_caching=True
     )
     fine_tokens = generate_fine(
         coarse_tokens,
-        history_prompt=history_prompt,
+        history_prompts=history_prompt,
         temp=0.5,
     )
     audio_arr = codec_decode(fine_tokens)
@@ -84,8 +84,8 @@ def save_as_prompt(filepath, full_generation):
 
 
 def generate_audio(
-    text: str,
-    history_prompt: Optional[Union[Dict, str]] = None,
+    text,
+    history_prompt,
     text_temp: float = 0.7,
     waveform_temp: float = 0.7,
     silent: bool = False,

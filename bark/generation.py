@@ -68,7 +68,7 @@ SUPPORTED_LANGS = [
     ("Chinese", "zh"),
 ]
 
-ALLOWED_PROMPTS = {"announcer"}
+ALLOWED_PROMPTS = {"announcer", "hey_james_494"}
 for _, lang in SUPPORTED_LANGS:
     for prefix in ("", f"v2{os.path.sep}"):
         for n in range(10):
@@ -375,8 +375,8 @@ def _load_history_prompt(history_prompt_input):
 
 
 def generate_text_semantic(
-    text,
-    history_prompt=None,
+    texts,
+    history_prompts=None,
     temp=0.7,
     top_k=None,
     top_p=None,
@@ -387,22 +387,42 @@ def generate_text_semantic(
     use_kv_caching=False,
 ):
     """Generate semantic tokens from text."""
-    assert isinstance(text, str)
-    text = _normalize_whitespace(text)
-    assert len(text.strip()) > 0
-    if history_prompt is not None:
-        history_prompt = _load_history_prompt(history_prompt)
-        semantic_history = history_prompt["semantic_prompt"]
-        assert (
-            isinstance(semantic_history, np.ndarray)
-            and len(semantic_history.shape) == 1
-            and len(semantic_history) > 0
-            and semantic_history.min() >= 0
-            and semantic_history.max() <= SEMANTIC_VOCAB_SIZE - 1
-        )
-    else:
-        semantic_history = None
-    # load models if not yet exist
+    # assertion
+    # assert isinstance(text, str)
+    # assert len(text.strip()) > 0
+
+    # load history
+    semantic_histories = []
+    for history_prompt in history_prompts:
+        if history_prompt is not None:
+            history_prompt = _load_history_prompt(history_prompt)
+            semantic_history = history_prompt["semantic_prompt"]
+            assert (
+                    isinstance(semantic_history, np.ndarray)
+                    and len(semantic_history.shape) == 1
+                    and len(semantic_history) > 0
+                    and semantic_history.min() >= 0
+                    and semantic_history.max() <= SEMANTIC_VOCAB_SIZE - 1
+            )
+        else:
+            semantic_history = None
+
+        if semantic_history is not None:
+            semantic_history = semantic_history.astype(np.int64)
+            # lop off if history is too long, pad if needed
+            semantic_history = semantic_history[-256:]
+            semantic_history = np.pad(
+                semantic_history,
+                (0, 256 - len(semantic_history)),
+                constant_values=SEMANTIC_PAD_TOKEN,
+                mode="constant",
+            )
+        else:
+            semantic_history = np.array([SEMANTIC_PAD_TOKEN] * 256)
+        semantic_histories.append(semantic_history)
+    semantic_histories = np.stack(semantic_histories)
+
+    # load models
     global models
     global models_devices
     if "text" not in models:
@@ -410,37 +430,34 @@ def generate_text_semantic(
     model_container = models["text"]
     model = model_container["model"]
     tokenizer = model_container["tokenizer"]
-    encoded_text = np.array(_tokenize(tokenizer, text)) + TEXT_ENCODING_OFFSET
+
     if OFFLOAD_CPU:
         model.to(models_devices["text"])
     device = next(model.parameters()).device
-    if len(encoded_text) > 256:
-        p = round((len(encoded_text) - 256) / len(encoded_text) * 100, 1)
-        logger.warning(f"warning, text too long, lopping of last {p}%")
-        encoded_text = encoded_text[:256]
-    encoded_text = np.pad(
-        encoded_text,
-        (0, 256 - len(encoded_text)),
-        constant_values=TEXT_PAD_TOKEN,
-        mode="constant",
-    )
-    if semantic_history is not None:
-        semantic_history = semantic_history.astype(np.int64)
-        # lop off if history is too long, pad if needed
-        semantic_history = semantic_history[-256:]
-        semantic_history = np.pad(
-            semantic_history,
-            (0, 256 - len(semantic_history)),
-            constant_values=SEMANTIC_PAD_TOKEN,
+
+    # text encoding
+    encoded_texts = []
+    for text in texts:
+        text = _normalize_whitespace(text)
+        encoded_text = np.array(_tokenize(tokenizer, text)) + TEXT_ENCODING_OFFSET
+        if len(encoded_text) > 256:
+            p = round((len(encoded_text) - 256) / len(encoded_text) * 100, 1)
+            logger.warning(f"warning, text too long, lopping of last {p}%")
+            encoded_text = encoded_text[:256]
+        encoded_text = np.pad(
+            encoded_text,
+            (0, 256 - len(encoded_text)),
+            constant_values=TEXT_PAD_TOKEN,
             mode="constant",
         )
-    else:
-        semantic_history = np.array([SEMANTIC_PAD_TOKEN] * 256)
+        encoded_texts.append(encoded_text)
+    encoded_texts = np.stack(encoded_texts)
+
     x = torch.from_numpy(
-        np.hstack([
-            encoded_text, semantic_history, np.array([SEMANTIC_INFER_TOKEN])
-        ]).astype(np.int64)
-    )[None]
+        np.concatenate([
+            encoded_texts, semantic_histories, np.array([[SEMANTIC_INFER_TOKEN]] * len(texts))
+        ], axis=1).astype(np.int64)
+    )
     assert x.shape[1] == 256 + 256 + 1
     with _inference_mode():
         x = x.to(device)
@@ -458,10 +475,10 @@ def generate_text_semantic(
             logits, kv_cache = model(
                 x_input, merge_context=True, use_cache=use_kv_caching, past_kv=kv_cache
             )
-            relevant_logits = logits[0, 0, :SEMANTIC_VOCAB_SIZE]
+            relevant_logits = logits[:, 0, :SEMANTIC_VOCAB_SIZE]
             if allow_early_stop:
                 relevant_logits = torch.hstack(
-                    (relevant_logits, logits[0, 0, [SEMANTIC_PAD_TOKEN]])  # eos
+                    (relevant_logits, logits[:, 0, [SEMANTIC_PAD_TOKEN]])  # eos
                 )
             if top_p is not None:
                 # faster to convert to numpy
@@ -481,14 +498,16 @@ def generate_text_semantic(
                 relevant_logits[relevant_logits < v[-1]] = -float("Inf")
             probs = F.softmax(relevant_logits / temp, dim=-1)
             item_next = torch.multinomial(probs, num_samples=1).to(torch.int32)
+            _sequence_finished = (item_next == SEMANTIC_VOCAB_SIZE) | (torch.tensor(min_eos_p is not None) & (probs[:, -1] >= min_eos_p).unsqueeze(1))
+            sequence_finished = _sequence_finished.prod(dim=1, keepdim=True)
+            item_next = item_next * (1 - sequence_finished) + SEMANTIC_PAD_TOKEN * sequence_finished
             if allow_early_stop and (
-                item_next == SEMANTIC_VOCAB_SIZE
-                or (min_eos_p is not None and probs[-1] >= min_eos_p)
+                sequence_finished.all()
             ):
                 # eos found, so break
                 pbar.update(n - pbar_state)
                 break
-            x = torch.cat((x, item_next[None]), dim=1)
+            x = torch.cat((x, item_next), dim=1)
             tot_generated_duration_s += 1 / SEMANTIC_RATE_HZ
             if max_gen_duration_s is not None and tot_generated_duration_s > max_gen_duration_s:
                 pbar.update(n - pbar_state)
@@ -506,10 +525,10 @@ def generate_text_semantic(
         pbar.total = n
         pbar.refresh()
         pbar.close()
-        out = x.detach().cpu().numpy().squeeze()[256 + 256 + 1 :]
+        out = x.detach().cpu().numpy()[:, 256 + 256 + 1:]
     if OFFLOAD_CPU:
         model.to("cpu")
-    assert all(0 <= out) and all(out < SEMANTIC_VOCAB_SIZE)
+    # assert all(0 <= out) and all(out < SEMANTIC_VOCAB_SIZE)
     _clear_cuda_cache()
     return out
 
@@ -530,7 +549,7 @@ COARSE_INFER_TOKEN = 12_050
 
 def generate_coarse(
     x_semantic,
-    history_prompt=None,
+    history_prompts=None,
     temp=0.7,
     top_k=None,
     top_p=None,
@@ -540,55 +559,65 @@ def generate_coarse(
     use_kv_caching=False,
 ):
     """Generate coarse audio codes from semantic tokens."""
-    assert (
-        isinstance(x_semantic, np.ndarray)
-        and len(x_semantic.shape) == 1
-        and len(x_semantic) > 0
-        and x_semantic.min() >= 0
-        and x_semantic.max() <= SEMANTIC_VOCAB_SIZE - 1
-    )
+    # assert (
+    #     isinstance(x_semantic, np.ndarray)
+    #     and len(x_semantic.shape) == 1
+    #     and len(x_semantic) > 0
+    #     and x_semantic.min() >= 0
+    #     and x_semantic.max() <= SEMANTIC_VOCAB_SIZE - 1
+    # )
     assert 60 <= max_coarse_history <= 630
     assert max_coarse_history + sliding_window_len <= 1024 - 256
     semantic_to_coarse_ratio = COARSE_RATE_HZ / SEMANTIC_RATE_HZ * N_COARSE_CODEBOOKS
     max_semantic_history = int(np.floor(max_coarse_history / semantic_to_coarse_ratio))
-    if history_prompt is not None:
-        history_prompt = _load_history_prompt(history_prompt)
-        x_semantic_history = history_prompt["semantic_prompt"]
-        x_coarse_history = history_prompt["coarse_prompt"]
-        assert (
-            isinstance(x_semantic_history, np.ndarray)
-            and len(x_semantic_history.shape) == 1
-            and len(x_semantic_history) > 0
-            and x_semantic_history.min() >= 0
-            and x_semantic_history.max() <= SEMANTIC_VOCAB_SIZE - 1
-            and isinstance(x_coarse_history, np.ndarray)
-            and len(x_coarse_history.shape) == 2
-            and x_coarse_history.shape[0] == N_COARSE_CODEBOOKS
-            and x_coarse_history.shape[-1] >= 0
-            and x_coarse_history.min() >= 0
-            and x_coarse_history.max() <= CODEBOOK_SIZE - 1
-            and (
-                round(x_coarse_history.shape[-1] / len(x_semantic_history), 1)
-                == round(semantic_to_coarse_ratio / N_COARSE_CODEBOOKS, 1)
+
+    x_coarse_histories = []
+    x_semantic_histories = []
+
+    for history_prompt in history_prompts:
+        if history_prompt is not None:
+            history_prompt = _load_history_prompt(history_prompt)
+            x_semantic_history = history_prompt["semantic_prompt"]
+            x_coarse_history = history_prompt["coarse_prompt"]
+            assert (
+                isinstance(x_semantic_history, np.ndarray)
+                and len(x_semantic_history.shape) == 1
+                and len(x_semantic_history) > 0
+                and x_semantic_history.min() >= 0
+                and x_semantic_history.max() <= SEMANTIC_VOCAB_SIZE - 1
+                and isinstance(x_coarse_history, np.ndarray)
+                and len(x_coarse_history.shape) == 2
+                and x_coarse_history.shape[0] == N_COARSE_CODEBOOKS
+                and x_coarse_history.shape[-1] >= 0
+                and x_coarse_history.min() >= 0
+                and x_coarse_history.max() <= CODEBOOK_SIZE - 1
+                and (
+                    round(x_coarse_history.shape[-1] / len(x_semantic_history), 1)
+                    == round(semantic_to_coarse_ratio / N_COARSE_CODEBOOKS, 1)
+                )
             )
-        )
-        x_coarse_history = _flatten_codebooks(x_coarse_history) + SEMANTIC_VOCAB_SIZE
-        # trim histories correctly
-        n_semantic_hist_provided = np.min(
-            [
-                max_semantic_history,
-                len(x_semantic_history) - len(x_semantic_history) % 2,
-                int(np.floor(len(x_coarse_history) / semantic_to_coarse_ratio)),
-            ]
-        )
-        n_coarse_hist_provided = int(round(n_semantic_hist_provided * semantic_to_coarse_ratio))
-        x_semantic_history = x_semantic_history[-n_semantic_hist_provided:].astype(np.int32)
-        x_coarse_history = x_coarse_history[-n_coarse_hist_provided:].astype(np.int32)
-        # TODO: bit of a hack for time alignment (sounds better)
-        x_coarse_history = x_coarse_history[:-2]
-    else:
-        x_semantic_history = np.array([], dtype=np.int32)
-        x_coarse_history = np.array([], dtype=np.int32)
+            x_coarse_history = _flatten_codebooks(x_coarse_history) + SEMANTIC_VOCAB_SIZE
+            # trim histories correctly
+            n_semantic_hist_provided = np.min(
+                [
+                    max_semantic_history,
+                    len(x_semantic_history) - len(x_semantic_history) % 2,
+                    int(np.floor(len(x_coarse_history) / semantic_to_coarse_ratio)),
+                ]
+            )
+            n_coarse_hist_provided = int(round(n_semantic_hist_provided * semantic_to_coarse_ratio))
+            x_semantic_history = x_semantic_history[-n_semantic_hist_provided:].astype(np.int32)
+            x_coarse_history = x_coarse_history[-n_coarse_hist_provided:].astype(np.int32)
+            # TODO: bit of a hack for time alignment (sounds better)
+            x_coarse_history = x_coarse_history[:-2]
+        else:
+            x_semantic_history = np.array([], dtype=np.int32)
+            x_coarse_history = np.array([], dtype=np.int32)
+        x_semantic_histories.append(x_semantic_history)
+        x_coarse_histories.append(x_coarse_history)
+    x_coarse_histories = np.stack(x_coarse_histories)
+    x_semantic_histories = np.stack(x_semantic_histories)
+
     # load models if not yet exist
     global models
     global models_devices
@@ -601,17 +630,18 @@ def generate_coarse(
     # start loop
     n_steps = int(
         round(
-            np.floor(len(x_semantic) * semantic_to_coarse_ratio / N_COARSE_CODEBOOKS)
+            np.floor(x_semantic.shape[1] * semantic_to_coarse_ratio / N_COARSE_CODEBOOKS)
             * N_COARSE_CODEBOOKS
         )
     )
     assert n_steps > 0 and n_steps % N_COARSE_CODEBOOKS == 0
-    x_semantic = np.hstack([x_semantic_history, x_semantic]).astype(np.int32)
-    x_coarse = x_coarse_history.astype(np.int32)
-    base_semantic_idx = len(x_semantic_history)
+    x_semantic = np.hstack([x_semantic_histories, x_semantic]).astype(np.int32)
+    x_coarse = x_coarse_histories.astype(np.int32)
+    base_semantic_idx = x_semantic_histories.shape[1]
     with _inference_mode():
-        x_semantic_in = torch.from_numpy(x_semantic)[None].to(device)
-        x_coarse_in = torch.from_numpy(x_coarse)[None].to(device)
+        x_semantic_in = torch.from_numpy(x_semantic).to(device)
+
+        x_coarse_in = torch.from_numpy(x_coarse).to(device)
         n_window_steps = int(np.ceil(n_steps / sliding_window_len))
         n_step = 0
         for _ in tqdm.tqdm(range(n_window_steps), total=n_window_steps, disable=silent):
@@ -628,7 +658,7 @@ def generate_coarse(
             x_in = torch.hstack(
                 [
                     x_in,
-                    torch.tensor([COARSE_INFER_TOKEN])[None].to(device),
+                    torch.tensor([[COARSE_INFER_TOKEN]] * x_in.shape[0]).to(device),
                     x_coarse_in[:, -max_coarse_history:],
                 ]
             )
@@ -650,7 +680,7 @@ def generate_coarse(
                 logit_end_idx = (
                     SEMANTIC_VOCAB_SIZE + (2 - int(is_major_step)) * CODEBOOK_SIZE
                 )
-                relevant_logits = logits[0, 0, logit_start_idx:logit_end_idx]
+                relevant_logits = logits[:, 0, logit_start_idx:logit_end_idx]
                 if top_p is not None:
                     # faster to convert to numpy
                     original_device = relevant_logits.device
@@ -670,53 +700,59 @@ def generate_coarse(
                 probs = F.softmax(relevant_logits / temp, dim=-1)
                 item_next = torch.multinomial(probs, num_samples=1).to(torch.int32)
                 item_next += logit_start_idx
-                x_coarse_in = torch.cat((x_coarse_in, item_next[None]), dim=1)
-                x_in = torch.cat((x_in, item_next[None]), dim=1)
+                x_coarse_in = torch.cat((x_coarse_in, item_next), dim=1)
+                x_in = torch.cat((x_in, item_next), dim=1)
                 del logits, relevant_logits, probs, item_next
                 n_step += 1
             del x_in
         del x_semantic_in
     if OFFLOAD_CPU:
         model.to("cpu")
-    gen_coarse_arr = x_coarse_in.detach().cpu().numpy().squeeze()[len(x_coarse_history) :]
+    gen_coarse_arr = x_coarse_in.detach().cpu().numpy()[:, x_coarse_histories.shape[1]:]
     del x_coarse_in
-    assert len(gen_coarse_arr) == n_steps
-    gen_coarse_audio_arr = gen_coarse_arr.reshape(-1, N_COARSE_CODEBOOKS).T - SEMANTIC_VOCAB_SIZE
+    assert gen_coarse_arr.shape[1] == n_steps
+    gen_coarse_audio_arr = gen_coarse_arr.reshape(gen_coarse_arr.shape[0], -1, N_COARSE_CODEBOOKS).transpose(0, 2, 1) - SEMANTIC_VOCAB_SIZE
     for n in range(1, N_COARSE_CODEBOOKS):
-        gen_coarse_audio_arr[n, :] -= n * CODEBOOK_SIZE
+        gen_coarse_audio_arr[:, n, :] -= n * CODEBOOK_SIZE
     _clear_cuda_cache()
     return gen_coarse_audio_arr
 
 
 def generate_fine(
     x_coarse_gen,
-    history_prompt=None,
+    history_prompts=None,
     temp=0.5,
     silent=True,
 ):
     """Generate full audio codes from coarse audio codes."""
-    assert (
-        isinstance(x_coarse_gen, np.ndarray)
-        and len(x_coarse_gen.shape) == 2
-        and 1 <= x_coarse_gen.shape[0] <= N_FINE_CODEBOOKS - 1
-        and x_coarse_gen.shape[1] > 0
-        and x_coarse_gen.min() >= 0
-        and x_coarse_gen.max() <= CODEBOOK_SIZE - 1
-    )
-    if history_prompt is not None:
-        history_prompt = _load_history_prompt(history_prompt)
-        x_fine_history = history_prompt["fine_prompt"]
-        assert (
-            isinstance(x_fine_history, np.ndarray)
-            and len(x_fine_history.shape) == 2
-            and x_fine_history.shape[0] == N_FINE_CODEBOOKS
-            and x_fine_history.shape[1] >= 0
-            and x_fine_history.min() >= 0
-            and x_fine_history.max() <= CODEBOOK_SIZE - 1
-        )
+    batch_size = x_coarse_gen.shape[0]
+    # history_prompt = history_prompts[0]
+    # assert (
+    #     isinstance(x_coarse_gen, np.ndarray)
+    #     and len(x_coarse_gen.shape) == 2
+    #     and 1 <= x_coarse_gen.shape[0] <= N_FINE_CODEBOOKS - 1
+    #     and x_coarse_gen.shape[1] > 0
+    #     and x_coarse_gen.min() >= 0
+    #     and x_coarse_gen.max() <= CODEBOOK_SIZE - 1
+    # )
+    x_fine_histories = []
+    if history_prompts is not None:
+        for history_prompt in history_prompts:
+            history_prompt = _load_history_prompt(history_prompt)
+            x_fine_history = history_prompt["fine_prompt"]
+            assert (
+                    isinstance(x_fine_history, np.ndarray)
+                    and len(x_fine_history.shape) == 2
+                    and x_fine_history.shape[0] == N_FINE_CODEBOOKS
+                    and x_fine_history.shape[1] >= 0
+                    and x_fine_history.min() >= 0
+                    and x_fine_history.max() <= CODEBOOK_SIZE - 1
+            )
+            x_fine_histories.append(x_fine_history)
     else:
-        x_fine_history = None
-    n_coarse = x_coarse_gen.shape[0]
+        x_fine_histories = None
+    x_fine_histories = np.stack(x_fine_histories)
+    n_coarse = x_coarse_gen.shape[1]
     # load models if not yet exist
     global models
     global models_devices
@@ -727,71 +763,77 @@ def generate_fine(
         model.to(models_devices["fine"])
     device = next(model.parameters()).device
     # make input arr
-    in_arr = np.vstack(
+    in_arr = np.concatenate(
         [
             x_coarse_gen,
-            np.zeros((N_FINE_CODEBOOKS - n_coarse, x_coarse_gen.shape[1]))
+            np.zeros((batch_size, N_FINE_CODEBOOKS - n_coarse, x_coarse_gen.shape[2]))
             + CODEBOOK_SIZE,  # padding
-        ]
+        ],
+        axis=1
     ).astype(np.int32)
     # prepend history if available (max 512)
-    if x_fine_history is not None:
-        x_fine_history = x_fine_history.astype(np.int32)
-        in_arr = np.hstack(
+    if x_fine_histories is not None:
+        x_fine_histories = x_fine_histories.astype(np.int32)
+        in_arr = np.concatenate(
             [
-                x_fine_history[:, -512:].astype(np.int32),
+                x_fine_histories[:, :, -512:].astype(np.int32),
                 in_arr,
-            ]
+            ],
+            axis=2
         )
-        n_history = x_fine_history[:, -512:].shape[1]
+        n_history = x_fine_histories[:, :, -512:].shape[2]
     else:
         n_history = 0
     n_remove_from_end = 0
     # need to pad if too short (since non-causal model)
-    if in_arr.shape[1] < 1024:
-        n_remove_from_end = 1024 - in_arr.shape[1]
+    if in_arr.shape[2] < 1024:
+        n_remove_from_end = 1024 - in_arr.shape[2]
         in_arr = np.hstack(
             [
                 in_arr,
-                np.zeros((N_FINE_CODEBOOKS, n_remove_from_end), dtype=np.int32) + CODEBOOK_SIZE,
+                np.zeros((batch_size, N_FINE_CODEBOOKS, n_remove_from_end), dtype=np.int32) + CODEBOOK_SIZE,
             ]
         )
     # we can be lazy about fractional loop and just keep overwriting codebooks
-    n_loops = np.max([0, int(np.ceil((x_coarse_gen.shape[1] - (1024 - n_history)) / 512))]) + 1
+    n_loops = np.max([0, int(np.ceil((x_coarse_gen.shape[2] - (1024 - n_history)) / 512))]) + 1
     with _inference_mode():
-        in_arr = torch.tensor(in_arr.T).to(device)
+        in_arr = torch.tensor(in_arr.transpose(0, 2, 1)).to(device)
+        # inference_inputs = []
         for n in tqdm.tqdm(range(n_loops), disable=silent):
-            start_idx = np.min([n * 512, in_arr.shape[0] - 1024])
-            start_fill_idx = np.min([n_history + n * 512, in_arr.shape[0] - 512])
+            start_idx = np.min([n * 512, in_arr.shape[1] - 1024])
+            start_fill_idx = np.min([n_history + n * 512, in_arr.shape[1] - 512])
             rel_start_fill_idx = start_fill_idx - start_idx
-            in_buffer = in_arr[start_idx : start_idx + 1024, :][None]
+            in_buffer = in_arr[:, start_idx : start_idx + 1024, :]
+            # inference_inputs.append((in_buffer, start_fill_idx, rel_start_fill_idx))
+        # for in_buffer, start_fill_idx, rel_start_fill_idx in inference_inputs:
             for nn in range(n_coarse, N_FINE_CODEBOOKS):
                 logits = model(nn, in_buffer)
                 if temp is None:
                     relevant_logits = logits[0, rel_start_fill_idx:, :CODEBOOK_SIZE]
                     codebook_preds = torch.argmax(relevant_logits, -1)
                 else:
-                    relevant_logits = logits[0, :, :CODEBOOK_SIZE] / temp
+                    relevant_logits = logits[:, :, :CODEBOOK_SIZE] / temp
                     probs = F.softmax(relevant_logits, dim=-1)
                     codebook_preds = torch.multinomial(
-                        probs[rel_start_fill_idx:1024], num_samples=1
-                    ).reshape(-1)
+                        probs[:, rel_start_fill_idx:1024].flatten(0, 1), num_samples=1
+                    ).reshape(batch_size, -1)
                 codebook_preds = codebook_preds.to(torch.int32)
-                in_buffer[0, rel_start_fill_idx:, nn] = codebook_preds
+
+                in_buffer[:, rel_start_fill_idx:, nn] = codebook_preds
                 del logits, codebook_preds
             # transfer over info into model_in and convert to numpy
             for nn in range(n_coarse, N_FINE_CODEBOOKS):
                 in_arr[
-                    start_fill_idx : start_fill_idx + (1024 - rel_start_fill_idx), nn
-                ] = in_buffer[0, rel_start_fill_idx:, nn]
+                    :, start_fill_idx: start_fill_idx + (1024 - rel_start_fill_idx), nn
+                ] = in_buffer[:, rel_start_fill_idx:, nn]
             del in_buffer
-        gen_fine_arr = in_arr.detach().cpu().numpy().squeeze().T
+        gen_fine_arr = in_arr.detach().cpu().numpy().transpose(0, 2, 1)
         del in_arr
     if OFFLOAD_CPU:
         model.to("cpu")
-    gen_fine_arr = gen_fine_arr[:, n_history:]
+    gen_fine_arr = gen_fine_arr[:, :, n_history:]
     if n_remove_from_end > 0:
-        gen_fine_arr = gen_fine_arr[:, :-n_remove_from_end]
+        gen_fine_arr = gen_fine_arr[:, :, :-n_remove_from_end]
     assert gen_fine_arr.shape[-1] == x_coarse_gen.shape[-1]
     _clear_cuda_cache()
     return gen_fine_arr
@@ -808,12 +850,12 @@ def codec_decode(fine_tokens):
     if OFFLOAD_CPU:
         model.to(models_devices["codec"])
     device = next(model.parameters()).device
-    arr = torch.from_numpy(fine_tokens)[None]
+    arr = torch.from_numpy(fine_tokens)
     arr = arr.to(device)
     arr = arr.transpose(0, 1)
     emb = model.quantizer.decode(arr)
     out = model.decoder(emb)
-    audio_arr = out.detach().cpu().numpy().squeeze()
+    audio_arr = out.detach().cpu().numpy().squeeze(1)
     del arr, emb, out
     if OFFLOAD_CPU:
         model.to("cpu")
