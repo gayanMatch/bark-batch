@@ -2,7 +2,7 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 
-from .generation import codec_decode, generate_coarse, generate_fine, generate_text_semantic
+from .generation import codec_decode, generate_coarse, generate_fine, generate_text_semantic, get_output_length
 
 
 def text_to_semantic(
@@ -110,6 +110,7 @@ def generate_audio(
         temp=text_temp,
         silent=silent,
     )
+    output_length = get_output_length(semantic_tokens)
     out = semantic_to_waveform(
         semantic_tokens,
         history_prompt=history_prompt,
@@ -122,4 +123,4 @@ def generate_audio(
         return full_generation, audio_arr
     else:
         audio_arr = out
-    return audio_arr
+    return audio_arr, output_length

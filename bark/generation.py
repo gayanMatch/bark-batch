@@ -530,7 +530,23 @@ def generate_text_semantic(
         model.to("cpu")
     # assert all(0 <= out) and all(out < SEMANTIC_VOCAB_SIZE)
     _clear_cuda_cache()
+
+
     return out
+
+
+def get_output_length(semantic_tokens):
+    semantic_to_coarse_ratio = (
+        COARSE_RATE_HZ
+        / SEMANTIC_RATE_HZ
+        * N_COARSE_CODEBOOKS
+    )
+    output_lengths = (semantic_tokens != SEMANTIC_PAD_TOKEN).sum(1)
+    output_lengths = np.floor(
+        output_lengths * semantic_to_coarse_ratio / N_COARSE_CODEBOOKS
+    )
+    output_lengths = np.int64(np.round(output_lengths * N_COARSE_CODEBOOKS))
+    return output_lengths // 2
 
 
 def _flatten_codebooks(arr, offset_size=CODEBOOK_SIZE):

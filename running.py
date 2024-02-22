@@ -5,8 +5,7 @@ import soundfile as sf
 preload_models()
 
 # generate audio from text
-texts = """
-It’s Sarah from ZOOM Realty Group. How is your day going?
+texts = """It’s Sarah from ZOOM Realty Group. How is your day going?
 I'm sorry to hear that. I'm calling because I noticed that you were looking for homes for sale recently. Can I talk to you about that?
 Great! So, I am on a recorded line and the reason I’m calling you is to find a time for you to chat with ZOOM Realty Group. What area are you looking for a home in?
 Got it. I apologize for the confusion. So, you're looking to sell your home. Do you have a timeframe for when you'll want to sell?
@@ -17,12 +16,13 @@ Okay, let's schedule a call to discuss your house. What time works best for you 
 prompt_texts = texts.split('\n')
 history_prompt = ['hey_james_494'] * len(prompt_texts)
 
-audio_array = generate_audio(
+audio_array, out_length = generate_audio(
     prompt_texts,
     history_prompt=history_prompt
 )
 print(audio_array.shape)
+print(out_length)
 import numpy as np
 # save audio to disk
 for i in range(len(prompt_texts)):
-    sf.write(f"bark_generation_{i}.wav", audio_array[i], SAMPLE_RATE)
+    sf.write(f"bark_generation_{i}.wav", audio_array[i, :out_length[i] * 320], SAMPLE_RATE)

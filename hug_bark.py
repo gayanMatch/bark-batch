@@ -21,7 +21,7 @@ text_prompt = [
     "I love Hugging Face, it's so cool.",
     "I love Hugging Face, it's so cool.",
     "I love Hugging Face, it's so cool.",
-    "I love Hugging Face, it's so cool.",
+    "Understood. So you're looking to sell your home as soon as possible. We can definitely help with that. Let's go ahead and schedule a call with someone on our team. Does today, tomorrow, or the day after tomorrow work best for your call?",
 ]
 
 inputs = processor(text_prompt).to(device)
