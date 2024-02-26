@@ -2,7 +2,7 @@ from bark import SAMPLE_RATE, generate_audio, preload_models
 import soundfile as sf
 
 # download and load all models
-preload_models()
+preload_models(coarse_use_small=True)
 
 # generate audio from text
 texts = """It’s Sarah from ZOOM Realty Group. How is your day going?
